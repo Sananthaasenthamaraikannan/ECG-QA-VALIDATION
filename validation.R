@@ -1,7 +1,5 @@
-# validate.R
 # Benchmark R-peak detection against expert annotations (MIT-BIH record 100).
-# Produces sensitivity + PPV for a baseline (global-threshold) detector and an
-# improved (moving-window) detector. Run after, or instead of, sourcing ecg_qa.R.
+# Produces sensitivity + PPV for a baseline (global-threshold) detector and an (moving-window) detector.
 
 library(tidyverse)
 FS <- 360
@@ -11,7 +9,7 @@ ann <- read_csv("D:/ECG QA VALIDATION/DATA/annotations_100.csv", show_col_types 
 x     <- sig[["MLII"]]
 truth <- ann$sample
 
-# ---- Detector 1: global threshold (60% of whole-record max) + 200ms refractory ----
+# Detector 1: global threshold (60% of whole-record max) + 200ms refractory 
 detect_global <- function(x, fs, frac = 0.6) {
   thr <- frac * max(x, na.rm = TRUE)
   idx <- which(x > thr)
@@ -20,7 +18,7 @@ detect_global <- function(x, fs, frac = 0.6) {
   peaks
 }
 
-# ---- Detector 2: moving-window threshold (55% of LOCAL max in a 2s window) ----
+# Detector 2: moving-window threshold (55% of LOCAL max in a 2s window) 
 detect_local <- function(x, fs, win_s = 2.0, frac = 0.55) {
   w <- as.integer(win_s * fs); refr <- as.integer(0.2 * fs)
   n <- length(x); peaks <- integer(0); last <- -1e9
@@ -34,7 +32,7 @@ detect_local <- function(x, fs, win_s = 2.0, frac = 0.55) {
   peaks
 }
 
-# ---- Matching: greedy nearest within 50ms tolerance ----
+# Matching: greedy nearest within 50ms tolerance 
 match_beats <- function(peaks, truth, fs, tol_s = 0.05) {
   tol <- as.integer(tol_s * fs)
   matched <- rep(FALSE, length(truth)); TP <- 0L
@@ -47,8 +45,6 @@ match_beats <- function(peaks, truth, fs, tol_s = 0.05) {
          sensitivity = round(TP/(TP+FN), 4), PPV = round(TP/(TP+FP), 4))
 }
 
-# NOTE: detect_local loops over 650k samples; in base R this is slow (minutes).
-# It is correct as written. For speed you can run it on a subset, or vectorise later.
 res_global <- match_beats(detect_global(x, FS), truth, FS) |> mutate(detector = "Global threshold (baseline)", .before = 1)
 res_local  <- match_beats(detect_local(x, FS),  truth, FS) |> mutate(detector = "Moving-window (improved)",   .before = 1)
 

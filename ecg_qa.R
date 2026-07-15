@@ -1,57 +1,52 @@
-# ecg_qa.R
-# ECG Data Quality Review — clinical-trial-style QA in R
+# ECG Data Exploration
 # Author: Sananthaa Senthamaraikannan
-# Purpose: Demonstrate the data-integrity checks a cardiac data processor performs
-#          before ECG interval data enters a trial database. NOT clinical diagnosis.
 
-# ---- Packages ----
 library(tidyverse)
+library(plotly)   
 
-# ---- Config ----
-FS <- 360  # sampling frequency (Hz). Set to match your dataset's header.
+FS <- 360
 LEADS <- c("MLII", "V5")
+BASE <- "D:/ECG QA VALIDATION"
 
-# ============================================================================
-# DATA SOURCE
-# ----------------------------------------------------------------------------
-# Path A (real data, recommended for the CV story): MIT-BIH Arrhythmia DB.
-#   In R:  install.packages("remotes"); remotes::install_github("...")  # (WFDB readers exist)
-#   Simplest cross-language route: use PhysioNet's Python `wfdb` to export CSV once,
-#   OR download a record's CSV via PhysioNet's LightWAVE "export" if you prefer no code.
-#   MIT-BIH record 100 = 2 leads (MLII, V5), 360 Hz. A 10s slice is ~3600 samples/lead.
-#
-# Path B (this repo's reproducible fallback): data/ecg_data.csv, a small synthetic
-#   multi-lead set with KNOWN, labelled defects so the QA logic is verifiable.
+# DATA SOURCE — MIT-BIH Arrhythmia Database (PhysioNet), pulled via wfdb.
+#   ecg_data.csv = 10s slices of record 100 (clean) + 108 (noisy).
 #   Columns: time_s, MLII, V5, record
-# ============================================================================
 
-ecg <- read_csv("data/ecg_data.csv", show_col_types = FALSE)
+ecg <- read_csv(file.path(BASE, "DATA", "ecg_data.csv"), show_col_types = FALSE)
 
-# ---- 1. Visualise one record with annotated PQRST ----
+# Records present (so the annotated-beat default isn't hard-coded to old names)
+CLEAN_REC <- ecg %>% distinct(record) %>% slice(1) %>% pull(record)
+
+# Interactive full-record trace
 plot_record <- function(df, rec, lead = "MLII") {
   d <- df %>% filter(record == rec)
-  ggplot(d, aes(time_s, .data[[lead]])) +
+  p <- ggplot(d, aes(time_s, .data[[lead]])) +
     geom_line(linewidth = 0.3) +
     labs(title = paste0("ECG — ", rec, " (lead ", lead, ")"),
          x = "Time (s)", y = "Amplitude (mV)") +
     theme_minimal(base_size = 11) +
     theme(panel.grid.minor = element_blank())
+  ggplotly(p, tooltip = c("x", "y"))
 }
 
-# Example annotated plot on the clean record (first full beat).
-annotated_beat <- function(df, rec = "rec_clean", lead = "MLII") {
-  d <- df %>% filter(record == rec, time_s >= 0.35, time_s <= 0.95)
-  ggplot(d, aes(time_s, .data[[lead]])) +
+# Interactive annotated PQRST (first full beat of the clean record)
+annotated_beat <- function(df, rec = CLEAN_REC, lead = "MLII") {
+  d <- df %>% filter(record == rec, time_s >= 0.0, time_s <= 1.0)
+  # anchor annotations to the actual R-peak so labels land correctly on real data
+  r_idx  <- which.max(d[[lead]])
+  r_time <- d$time_s[r_idx]
+  p <- ggplot(d, aes(time_s, .data[[lead]])) +
     geom_line(linewidth = 0.4) +
-    annotate("text", x = 0.34, y = 0.15, label = "P",  fontface = "bold") +
-    annotate("text", x = 0.50, y = 1.02, label = "QRS", fontface = "bold") +
-    annotate("text", x = 0.72, y = 0.28, label = "T",  fontface = "bold") +
     labs(title = paste0("Annotated PQRST — ", rec),
          x = "Time (s)", y = "Amplitude (mV)") +
     theme_minimal(base_size = 11)
+  ggplotly(p, tooltip = c("x", "y")) %>%
+    add_annotations(x = r_time - 0.16, y = 0.15,               text = "P",   showarrow = FALSE, font = list(size = 13)) %>%
+    add_annotations(x = r_time,        y = max(d[[lead]]) * 1.05, text = "QRS", showarrow = FALSE, font = list(size = 13)) %>%
+    add_annotations(x = r_time + 0.22, y = 0.28,               text = "T",   showarrow = FALSE, font = list(size = 13))
 }
 
-# ---- 2. R-peak detection (simple threshold + refractory period) ----
+# R-peak detection (simple threshold + refractory period) 
 detect_r_peaks <- function(x, fs = FS) {
   thr <- 0.6 * max(x, na.rm = TRUE)
   idx <- which(x > thr)
@@ -63,10 +58,10 @@ detect_r_peaks <- function(x, fs = FS) {
   peaks
 }
 
-# ---- 3. QA routine: returns one row per record ----
+# QA routine: returns one row per record 
 qa_record <- function(d, fs = FS, leads = LEADS) {
   flags <- character(0)
-
+  
   for (ld in leads) {
     sig <- d[[ld]]
     # (a) Dropped/flat lead: near-zero variance across whole recording
@@ -81,12 +76,14 @@ qa_record <- function(d, fs = FS, leads = LEADS) {
       }
       if (flat) flags <- c(flags, paste0(ld, ": flatline segment detected"))
     }
-    # (c) Excessive noise: large sample-to-sample differences
-    if (sd(diff(sig), na.rm = TRUE) > 0.15) {
+    # (c) Excessive noise: large sample-to-sample differences.
+    #     Real MIT-BIH signals are noisier than synthetic data, so 0.15 over-flags;
+    #     0.25 separates record 108's genuine artefact from clean record 100.
+    if (sd(diff(sig), na.rm = TRUE) > 0.25) {
       flags <- c(flags, paste0(ld, ": excessive noise/artefact"))
     }
   }
-
+  
   # (d) Heart-rate plausibility from primary lead
   peaks <- detect_r_peaks(d[["MLII"]], fs)
   if (length(peaks) > 1) {
@@ -99,7 +96,7 @@ qa_record <- function(d, fs = FS, leads = LEADS) {
   } else {
     flags <- c(flags, "insufficient R-peaks detected (review recording)")
   }
-
+  
   tibble(
     record  = unique(d$record),
     n_flags = length(flags),
@@ -108,21 +105,24 @@ qa_record <- function(d, fs = FS, leads = LEADS) {
   )
 }
 
-# ---- 4. Run QA across all records ----
+# Run QA across all records 
 qa_summary <- ecg %>%
   group_split(record) %>%
   map_dfr(qa_record)
 
 print(qa_summary)
 
-# ---- 5. Save outputs ----
-if (!dir.exists("outputs")) dir.create("outputs")
-write_csv(qa_summary, "outputs/qa_summary.csv")
+# Save outputs 
+out_dir <- file.path(BASE, "outputs")
+dir.create(out_dir, showWarnings = FALSE)
+write_csv(qa_summary, file.path(out_dir, "qa_summary.csv"))
 
-ggsave("outputs/annotated_beat.png", annotated_beat(ecg), width = 6, height = 3.2, dpi = 150)
+# Interactive plots: save as self-contained HTML (open in any browser)
+htmlwidgets::saveWidget(annotated_beat(ecg),
+                        file.path(out_dir, "annotated_beat.html"), selfcontained = TRUE)
 walk(unique(ecg$record), function(r) {
-  ggsave(paste0("outputs/wave_", r, ".png"), plot_record(ecg, r),
-         width = 7, height = 2.6, dpi = 150)
+  htmlwidgets::saveWidget(plot_record(ecg, r),
+                          file.path(out_dir, paste0("wave_", r, ".html")), selfcontained = TRUE)
 })
 
-message("QA complete. See outputs/qa_summary.csv")
+message("QA complete. Interactive plots + qa_summary.csv saved to outputs/")
