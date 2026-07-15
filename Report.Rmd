@@ -1,0 +1,179 @@
+---
+title: "ECG Data Exploration"
+author: "Sananthaa Senthamaraikannan"
+date: "07-07-2026"
+output:
+  html_document:
+    toc: true
+    theme: flatly
+    highlight: null
+bibliography: references/references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 2.8)
+library(tidyverse)
+
+BASE <- "D:/ECG QA VALIDATION"
+ecg        <- read_csv(file.path(BASE, "DATA", "ecg_data.csv"),          show_col_types = FALSE)
+qa_summary <- read_csv(file.path(BASE, "outputs", "qa_summary.csv"),     show_col_types = FALSE)
+validation <- read_csv(file.path(BASE, "outputs", "validation_100.csv"), show_col_types = FALSE)
+```
+
+## Why I built this
+
+I'm a Health Data Science master's student with a background in statistics and R, trying to
+move into clinical data work. My stats and programming are reasonably solid, but I had almost
+no background in cardiology or ECGs when I started — so I set myself a small, honest goal:
+take real clinical ECG recordings, learn what a data reviewer actually checks, and build a
+reproducible quality-control workflow in R. This write-up is me working through that, and
+I've tried to be upfront about what I understood well and what I had to look up.
+
+The clinical context, as I understand it: in drug trials, ECGs are collected mainly to watch
+for cardiac safety problems, especially whether a drug lengthens the **QT interval** (there's
+a regulatory guideline, ICH E14, specifically about this). A central ECG lab receives
+recordings from many trial sites, and **data processors** check that each recording is
+complete, correctly labelled, and good enough quality before the measurements are trusted.
+That checking step is what I set out to reproduce.
+
+> Scope: this is a **data-quality** project, not clinical diagnosis. I am not qualified to
+> interpret ECGs medically, and nothing here is clinical judgement. It's about the data.
+
+## What I learned about the signal
+
+Every heartbeat shows up as a shape called a **PQRST** complex. Once I could recognise it,
+the rest made more sense:
+
+- the **P wave** is a small bump (the atria firing),
+- the **QRS complex** is the big spike (the main pumping chambers firing — easiest to detect
+  automatically because it's so tall),
+- the **T wave** is the rounded bump after it (the heart resetting electrically).
+
+Reviewers care about the timing between these — the intervals. I put the table below together
+while learning. I'm treating these as *typical reference ranges*, not clinical thresholds:
+they vary by source, sex, age and correction formula, so I've kept that framing throughout.
+
+| Interval | What it measures | Typical adult range | Why it matters |
+|---|---|---|---|
+| RR | time between beats | sets the heart rate | HR = 60 / RR; needed to correct QT |
+| PR | P start to QRS start | 120-200 ms | conduction timing |
+| QRS | width of the spike | < 120 ms | ventricular conduction |
+| QT | QRS start to T end | ~350-450 ms | the main drug-safety number |
+| QTc | QT corrected for HR | < ~450-470 ms | what ICH E14 focuses on |
+
+One thing I found interesting: QT has to be *corrected* for heart rate before you can compare
+it, because it naturally shortens when the heart beats faster. The classic fix is Bazett's
+formula (QTc = QT / sqrt(RR)), which I read tends to over-correct at high heart rates — so
+even the "standard" method has known weaknesses.
+
+```{r annotated, fig.height=2.8}
+clean_rec <- ecg %>% distinct(record) %>% slice(1) %>% pull(record)
+d <- ecg %>% filter(record == clean_rec, time_s <= 1.0)
+r_time <- d$time_s[which.max(d$MLII)]
+ggplot(d, aes(time_s, MLII)) +
+  geom_line(linewidth = 0.4) +
+  annotate("text", x = r_time - 0.16, y = 0.15,               label = "P",   fontface = "bold") +
+  annotate("text", x = r_time,        y = max(d$MLII) * 1.05, label = "QRS", fontface = "bold") +
+  annotate("text", x = r_time + 0.22, y = 0.30,               label = "T",   fontface = "bold") +
+  labs(title = "One heartbeat, labelled (record 100, lead MLII)",
+       x = "Time (s)", y = "Amplitude (mV)") +
+  theme_minimal(base_size = 11)
+```
+
+*Plotting one beat and labelling P, QRS and T myself was where the theory actually clicked.*
+
+## The data I used
+
+```{r dataset}
+ecg %>% group_by(record) %>%
+  summarise(leads = "MLII, V5", samples = n(),
+            duration_s = round(max(time_s), 1), .groups = "drop") %>%
+  knitr::kable()
+```
+
+I used the **MIT-BIH Arrhythmia Database** [@moody2001mitbih], hosted on PhysioNet
+[@goldberger2000physionet] — two-lead ECG recorded at 360 Hz. The recordings come in a
+special format (not plain CSV), so I learned to export them with the `wfdb` reader
+[@wfdbpython]. I picked two records on purpose: record 100 is clean, and record 108 has real
+noise and baseline shifts — so I'd have one recording that should pass and one that shouldn't.
+For validation I also used record 100's full 30-minute signal, which comes with beats labelled
+by cardiologists.
+
+## How my QA check works
+
+For each recording, and each of the two leads, my routine checks a few things a reviewer would
+care about: whether a lead has **dropped out** (flat signal), whether there's a **flatline
+segment**, and whether there's **too much noise** (measured as large jumps between consecutive
+samples). It then estimates heart rate from the detected beats and flags it if it comes out
+physiologically implausible. A record only passes if nothing trips. All of this is written in
+R using the tidyverse [@tidyverse].
+
+## What it found
+
+```{r findings}
+knitr::kable(qa_summary)
+```
+
+Record 100 passed everything, as expected for a clean recording. Record 108 got flagged — and
+*how* it got flagged is the part I found most interesting, and honestly didn't plan.
+
+It didn't trip the noise flag directly. Instead it produced an impossible heart rate. When I
+dug into why, it made sense: record 108 is noisy enough that my beat detector gets confused,
+misses beats, and the heart-rate calculation built on top of that comes out as nonsense. So a
+problem in the raw signal quietly turned into a wrong number downstream.
+
+That felt like a genuinely useful lesson about clinical data — a suspicious value isn't always
+wrong *at* that value; sometimes it's a symptom of a data-quality problem further up. A
+reviewer who just saw "heart rate = 21" and corrected the number would miss the real issue,
+which is the noise. I'd rather my tool surface that than hide it.
+
+*(Interactive versions of each trace are saved next to this report as `wave_<record>.html`, so
+the noise in record 108 can be scrolled through and seen.)*
+
+## Checking whether my beat detector actually works
+
+The part I was least sure about was my R-peak detector — it's a simple threshold method, and I
+wanted to know if it was actually any good rather than just assuming. Record 100 comes with
+**2,273 beats labelled by cardiologists**, so I could check my detected beats against theirs. I
+matched each detected peak to an expert beat within 50 ms and computed two things: **sensitivity**
+(of the real beats, how many did I catch?) and **precision / PPV** (of the beats I flagged, how
+many were real?).
+
+```{r validation}
+knitr::kable(validation)
+```
+
+My first attempt used one fixed threshold for the whole recording. It was very precise (almost
+everything it flagged was a real beat) but its sensitivity was only about 82% — it was *missing*
+413 beats. That surprised me, so I looked at where the misses were: the signal amplitude drifts
+up and down over the 30 minutes, and a single threshold set from the whole-record maximum ends
+up too high during the quieter stretches, so those beats slip under it.
+
+Once I understood that, the fix was fairly natural — use a **moving-window threshold** that
+adapts to the local signal instead of one global cut-off. That pushed sensitivity up to about
+99.9% while keeping precision basically the same. Going from diagnosing *why* it failed to fixing
+it was the most satisfying part of the project.
+
+I also built a small interactive viewer (`ecg_viewer.html`) so you can flip between the two
+detectors and watch the missed beats appear and disappear.
+
+## What I'd flag about my own work
+
+I want to be honest about the limits, because pretending otherwise defeats the point:
+
+- My beat detector is deliberately simple. Real ECG labs use validated algorithms and still have
+  a human check the results. Mine is a learning exercise, not production-grade.
+- I didn't actually *measure* the PR/QT/QTc intervals from the signal — I only discussed them. A
+  real workflow would bring those in from validated measurements.
+- I tuned the improved detector's settings on record 100 and didn't test them on other records,
+  so I can't claim they'd generalise. That's exactly what I'd test next.
+
+The one bit of professional framing I tried to respect: clinical data work follows data-integrity
+principles (I came across "ALCOA+"). My outputs are attributable and dated, the scripts make
+everything reproducible, and the QA flags never overwrite the raw signal — the original data
+stays intact and the review is logged separately. That felt like the right habit to build early.
+
+## References
+
+Full reference details, including guidelines and physiology sources.

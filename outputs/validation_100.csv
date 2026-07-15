@@ -1,0 +1,3 @@
+detector,expert_beats,detected,TP,FP,FN,sensitivity,PPV
+Global threshold (baseline),2273,1861,1860,1,413,0.8183,0.9995
+Moving-window (improved),2273,2272,2271,1,2,0.9991,0.9996
